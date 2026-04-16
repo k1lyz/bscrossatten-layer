@@ -25,7 +25,6 @@ if __name__ == '__main__':
     WORKING_DIR = '/kaggle/working'
     checkpoints_dir = os.path.join(WORKING_DIR, 'checkpoints')
 
-    # 从可写区加载模型权重
     checkpoint_path = os.path.join(checkpoints_dir, args.name, f'checkpoint_best{args.extra}.pt')
     checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
 
@@ -33,6 +32,7 @@ if __name__ == '__main__':
     extra = args.extra
 
     args = checkpoint['args'] if checkpoint['args'] is not None else args
+    # 这里通过 namespace=args 会继承我们在 train.py parser 中新加的消融参数
     args, unknown = parser.parse_known_args(namespace=args)
     print(args)
 
@@ -58,14 +58,12 @@ if __name__ == '__main__':
         if i not in value2slot:
             value2slot[i] = -1
 
-
     def get_depth(x):
         depth = 0
         while value2slot[x] != -1:
             depth += 1
             x = value2slot[x]
         return depth
-
 
     depth_dict = {i: get_depth(i) for i in range(num_class)}
     max_depth = depth_dict[max(depth_dict, key=depth_dict.get)] + 1
@@ -91,7 +89,6 @@ if __name__ == '__main__':
                 prefix.append(tokenizer.vocab_size + num_class + max_depth)
             prefix.append(tokenizer.sep_token_id)
 
-
             def data_map_function(batch, tokenizer):
                 new_batch = {'input_ids': [], 'token_type_ids': [], 'attention_mask': [], 'labels': []}
                 for l, t in zip(batch['label'], batch['token']):
@@ -115,7 +112,6 @@ if __name__ == '__main__':
 
                 return new_batch
 
-
             dataset = dataset.map(lambda x: data_map_function(x, tokenizer), batched=True)
             dataset.save_to_disk(prompt_cache_path)
 
@@ -128,20 +124,18 @@ if __name__ == '__main__':
     else:
         raise NotImplementedError
 
-    model = Prompt.from_pretrained(
-        args.arch, num_labels=len(label_dict), path_list=path_list, layer=args.layer,
-        graph_type=args.graph, data_path=data_path, depth2label=depth2label,
-        use_cross_attn=getattr(args, 'use_cross_attn', False),  # 从保存的权重配置中读取
-        use_const_loss=getattr(args, 'use_const_loss', False),  # 从保存的权重配置中读取
-        value2slot=value2slot,
-        depth_dict=depth_dict
-    )
-    
+    # === 初始化模型并传入消融参数与拓扑 ===
+    model = Prompt.from_pretrained(args.arch, num_labels=len(label_dict), path_list=path_list, layer=args.layer,
+                                   graph_type=args.graph, data_path=data_path, depth2label=depth2label,
+                                   value2slot=value2slot,
+                                   ablation_logits_mask=args.ablation_logits_mask,
+                                   ablation_hierarchical_loss=args.ablation_hierarchical_loss,
+                                   ablation_cross_attn=args.ablation_cross_attn,
+                                   ablation_deep_prefix=args.ablation_deep_prefix)
     model.init_embedding()
     model.load_state_dict(checkpoint['param'])
     model.to('cuda')
 
-    # 增加双卡支持
     if torch.cuda.device_count() > 1:
         model = nn.DataParallel(model)
 
@@ -157,7 +151,7 @@ if __name__ == '__main__':
     with torch.no_grad(), tqdm(test) as pbar:
         for batch in pbar:
             batch = {k: v.to('cuda') for k, v in batch.items()}
-            output_ids, logits = model_to_eval.generate(batch['input_ids'], depth2label=depth2label, )
+            output_ids, logits = model_to_eval.generate(batch['input_ids'], depth2label=depth2label)
             for out, g, lo in zip(output_ids, batch['labels'], logits):
                 case_logits = torch.zeros(logits.size(-1))
                 for i in set(out):
