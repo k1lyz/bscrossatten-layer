@@ -30,14 +30,19 @@ def parse():
     parser.add_argument('--name', type=str, required=True)
     parser.add_argument('--update', type=int, default=1)
     parser.add_argument('--model', type=str, default='prompt')
-    parser.add_argument('--wandb', default=False, action='store_true')  # 依然保留该参数名，但实际控制 swanlab
+    parser.add_argument('--wandb', default=False, action='store_true')
     parser.add_argument('--arch', type=str, default='bert-base-uncased')
     parser.add_argument('--layer', type=int, default=1)
     parser.add_argument('--graph', type=str, default='GAT')
     parser.add_argument('--low-res', default=False, action='store_true')
     parser.add_argument('--seed', default=3, type=int)
-    parser.add_argument('--use_cross_attn', default=False, action='store_true')
-    parser.add_argument('--use_const_loss', default=False, action='store_true')
+    
+    # === 新增消融实验参数 ===
+    parser.add_argument('--ablation_logits_mask', action='store_true', help='开启推理期向下对数几率掩码 (标签一致性)')
+    parser.add_argument('--ablation_hierarchical_loss', action='store_true', help='开启三元组层次分离损失 (标签一致性)')
+    parser.add_argument('--ablation_cross_attn', action='store_true', help='开启文本-标签概念深度交叉注意力 (语义交互)')
+    parser.add_argument('--ablation_deep_prefix', action='store_true', help='开启SPIRIT深度前缀融合 (结构融合)')
+    
     return parser
 
 
@@ -49,7 +54,6 @@ class Save:
         self.args = args
 
     def __call__(self, score, best_score, name):
-        # 兼容多卡保存，去除 module. 前缀，防止在 test.py 单卡加载时报错
         model_to_save = self.model.module if hasattr(self.model, 'module') else self.model
         torch.save({'param': model_to_save.state_dict(),
                     'optim': self.optimizer.state_dict(),
@@ -65,25 +69,22 @@ if __name__ == '__main__':
 
     if args.wandb:
         swanlab.login(api_key='DQ5WCNvv4ra2WikI9c59a', save=False)
-        swanlab.init(config=vars(args), project='bs',name=args.name)
+        swanlab.init(config=vars(args), project='bs', name=args.name)
     print(args)
     utils.seed_torch(args.seed)
 
     tokenizer = AutoTokenizer.from_pretrained(args.arch)
 
-    # 读写分离配置：自适应判断是在 Kaggle 还是在本地
     if os.path.exists('/kaggle/working'):
-        # --- Kaggle 环境 ---
         WORKING_DIR = '/kaggle/working'
         KAGGLE_INPUT_DIR = '/kaggle/input/datasets/slbao8/bsdata/data'
-        data_path = os.path.join(KAGGLE_INPUT_DIR, args.data)  # 指向 Kaggle 挂载的只读数据集
+        data_path = os.path.join(KAGGLE_INPUT_DIR, args.data)
     else:
-        # --- 本地电脑环境 ---
         WORKING_DIR = current_dir
-        data_path = os.path.join(current_dir, 'data', args.data)  # 指向本地项目里的 data 文件夹
+        data_path = os.path.join(current_dir, 'data', args.data)
 
-    working_data_path = os.path.join(WORKING_DIR, 'data_cache', args.data)  # 可写：缓存生成路径 (改了个名字避免和原data混淆)
-    checkpoints_dir = os.path.join(WORKING_DIR, 'checkpoints')  # 可写：权重保存路径
+    working_data_path = os.path.join(WORKING_DIR, 'data_cache', args.data)
+    checkpoints_dir = os.path.join(WORKING_DIR, 'checkpoints')
 
     os.makedirs(working_data_path, exist_ok=True)
     os.makedirs(os.path.join(checkpoints_dir, args.data + '-' + args.name), exist_ok=True)
@@ -91,7 +92,6 @@ if __name__ == '__main__':
     args.name = args.data + '-' + args.name
     batch_size = args.batch
 
-    # 读取基础字典
     label_dict = torch.load(os.path.join(data_path, 'value_dict.pt'), weights_only=False)
     label_dict = {i: v for i, v in label_dict.items()}
 
@@ -109,14 +109,12 @@ if __name__ == '__main__':
         if i not in value2slot:
             value2slot[i] = -1
 
-
     def get_depth(x):
         depth = 0
         while value2slot[x] != -1:
             depth += 1
             x = value2slot[x]
         return depth
-
 
     depth_dict = {i: get_depth(i) for i in range(num_class)}
     max_depth = depth_dict[max(depth_dict, key=depth_dict.get)] + 1
@@ -131,7 +129,6 @@ if __name__ == '__main__':
         if os.path.exists(prompt_cache_path):
             dataset = datasets.load_from_disk(prompt_cache_path)
         else:
-            # 数据集从只读的 data_path 读取
             dataset = datasets.load_dataset('json',
                                             data_files={'train': os.path.join(data_path, f'{args.data}_train.json'),
                                                         'dev': os.path.join(data_path, f'{args.data}_dev.json'),
@@ -142,7 +139,6 @@ if __name__ == '__main__':
                 prefix.append(tokenizer.vocab_size + num_class + i)
                 prefix.append(tokenizer.vocab_size + num_class + max_depth)
             prefix.append(tokenizer.sep_token_id)
-
 
             def data_map_function(batch, tokenizer):
                 new_batch = {'input_ids': [], 'token_type_ids': [], 'attention_mask': [], 'labels': []}
@@ -167,9 +163,7 @@ if __name__ == '__main__':
 
                 return new_batch
 
-
             dataset = dataset.map(lambda x: data_map_function(x, tokenizer), batched=True)
-            # 生成的数据集缓存存入 /kaggle/working
             dataset.save_to_disk(prompt_cache_path)
 
         dataset['train'].set_format('torch', columns=['attention_mask', 'input_ids', 'labels'])
@@ -191,25 +185,22 @@ if __name__ == '__main__':
             json.dump(index, open(low_res_path, 'w', encoding='utf-8'))
         dataset['train'] = dataset['train'].select(index[len(index) // 5:len(index) // 10 * 3])
 
-    
-    model = Prompt.from_pretrained(
-        args.arch, num_labels=len(label_dict), path_list=path_list, layer=args.layer,
-        graph_type=args.graph, data_path=data_path, depth2label=depth2label,
-        use_cross_attn=args.use_cross_attn,    # 传入注意力开关
-        use_const_loss=args.use_const_loss,    # 传入损失开关
-        value2slot=value2slot,                 # 传入层级字典
-        depth_dict=depth_dict                  # 传入深度字典
-    )
-    
+    # === 初始化模型并传入消融参数与拓扑 ===
+    model = Prompt.from_pretrained(args.arch, num_labels=len(label_dict), path_list=path_list, layer=args.layer,
+                                   graph_type=args.graph, data_path=data_path, depth2label=depth2label,
+                                   value2slot=value2slot,
+                                   ablation_logits_mask=args.ablation_logits_mask,
+                                   ablation_hierarchical_loss=args.ablation_hierarchical_loss,
+                                   ablation_cross_attn=args.ablation_cross_attn,
+                                   ablation_deep_prefix=args.ablation_deep_prefix)
     model.init_embedding()
     model.to('cuda')
 
-    # 多卡双卡运行逻辑支持
     if torch.cuda.device_count() > 1:
         print(f"Let's use {torch.cuda.device_count()} GPUs!")
         model = nn.DataParallel(model)
 
-    train = DataLoader(dataset['train'], batch_size=batch_size, shuffle=True, )
+    train = DataLoader(dataset['train'], batch_size=batch_size, shuffle=True)
     dev = DataLoader(dataset['dev'], batch_size=8, shuffle=False)
     optimizer = Adam(model.parameters(), lr=args.lr)
 
@@ -231,7 +222,6 @@ if __name__ == '__main__':
                 batch = {k: v.to('cuda') if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
                 output = model(**batch)
 
-                # 如果是多卡，loss会返回多个卡的结果，需要 mean
                 loss_val = output['loss'].mean() if torch.cuda.device_count() > 1 else output['loss']
                 loss_val.backward()
                 loss += loss_val.item()
@@ -249,13 +239,12 @@ if __name__ == '__main__':
         pred = []
         gold = []
 
-        # 多卡时调用自定义方法 generate 需要通过 .module
         model_to_eval = model.module if hasattr(model, 'module') else model
 
         with torch.no_grad(), tqdm(dev) as pbar:
             for batch in pbar:
                 batch = {k: v.to('cuda') if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-                output_ids, logits = model_to_eval.generate(batch['input_ids'], depth2label=depth2label, )
+                output_ids, logits = model_to_eval.generate(batch['input_ids'], depth2label=depth2label)
                 for out, g in zip(output_ids, batch['labels']):
                     pred.append(set([i for i in out]))
                     gold.append([])
@@ -289,13 +278,10 @@ if __name__ == '__main__':
 
         torch.cuda.empty_cache()
 
-    # test
     test = DataLoader(dataset['test'], batch_size=8, shuffle=False)
     model.eval()
 
-
     def test_function(extra):
-        # 权重加载同样要加上 weights_only=False，并指向 /kaggle/working/checkpoints
         checkpoint = torch.load(os.path.join(checkpoints_dir, args.name, f'checkpoint_best{extra}.pt'),
                                 map_location='cpu', weights_only=False)
         model_to_eval = model.module if hasattr(model, 'module') else model
@@ -306,7 +292,7 @@ if __name__ == '__main__':
         with torch.no_grad(), tqdm(test) as pbar:
             for batch in pbar:
                 batch = {k: v.to('cuda') for k, v in batch.items()}
-                output_ids, logits = model_to_eval.generate(batch['input_ids'], depth2label=depth2label, )
+                output_ids, logits = model_to_eval.generate(batch['input_ids'], depth2label=depth2label)
                 for out, g in zip(output_ids, batch['labels']):
                     pred.append(set([i for i in out]))
                     gold.append([])
@@ -320,12 +306,10 @@ if __name__ == '__main__':
         micro_f1 = scores['micro_f1']
         print('macro', macro_f1, 'micro', micro_f1)
 
-        # txt 保存指向可写路径，增加 utf-8
         with open(os.path.join(checkpoints_dir, args.name, f'result{extra}.txt'), 'w', encoding='utf-8') as f:
             print('macro', macro_f1, 'micro', micro_f1, file=f)
             prefix = 'test' + extra
         if args.wandb:
             swanlab.log({prefix + '_macro': macro_f1, prefix + '_micro': micro_f1})
-
 
     test_function('_macro')
