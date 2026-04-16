@@ -128,8 +128,15 @@ if __name__ == '__main__':
     else:
         raise NotImplementedError
 
-    model = Prompt.from_pretrained(args.arch, num_labels=len(label_dict), path_list=path_list, layer=args.layer,
-                                   graph_type=args.graph, data_path=data_path, depth2label=depth2label, )
+    model = Prompt.from_pretrained(
+        args.arch, num_labels=len(label_dict), path_list=path_list, layer=args.layer,
+        graph_type=args.graph, data_path=data_path, depth2label=depth2label,
+        use_cross_attn=getattr(args, 'use_cross_attn', False),  # 从保存的权重配置中读取
+        use_const_loss=getattr(args, 'use_const_loss', False),  # 从保存的权重配置中读取
+        value2slot=value2slot,
+        depth_dict=depth_dict
+    )
+    
     model.init_embedding()
     model.load_state_dict(checkpoint['param'])
     model.to('cuda')
