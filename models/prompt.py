@@ -1,7 +1,5 @@
 from transformers.models.bert.modeling_bert import BertModel, BertPreTrainedModel, BertOnlyMLMHead
-from transformers.modeling_outputs import (
-    MaskedLMOutput
-)
+from transformers.modeling_outputs import MaskedLMOutput
 from transformers.activations import ACT2FN
 from torch.nn import CrossEntropyLoss, MSELoss
 import torch.nn as nn
@@ -36,28 +34,23 @@ class GraphEmbedding(nn.Module):
     @property
     def weight(self):
         def foo():
-            # label prompt MASK
             edge_features = self.new_embedding.weight[1:, :]
             if self.graph_type != '':
-                # label prompt
                 edge_features = edge_features[:-1, :]
                 edge_features = self.graph(edge_features, self.original_embedding)
                 edge_features = torch.cat(
                     [edge_features, self.new_embedding.weight[-1:, :]], dim=0)
             return torch.cat([self.original_embedding.weight, edge_features], dim=0)
-
         return foo
 
     @property
     def raw_weight(self):
         def foo():
             return torch.cat([self.original_embedding.weight, self.new_embedding.weight[1:, :]], dim=0)
-
         return foo
 
     def forward(self, x):
         x = F.embedding(x, self.weight(), self.padding_idx)
-
         return x
 
 
@@ -81,6 +74,19 @@ class Prompt(BertPreTrainedModel):
         self.path_list = path_list
         self.depth2label = depth2label
         self.layer = layer
+
+        # === 接收消融实验参数 ===
+        self.use_cross_attn = kwargs.get('use_cross_attn', False)
+        self.use_const_loss = kwargs.get('use_const_loss', False)
+        self.value2slot = kwargs.get('value2slot', None)
+        self.depth_dict = kwargs.get('depth_dict', None)
+
+        if self.use_cross_attn:
+            self.text_to_label_attn = CrossAttention(config.hidden_size, config.num_attention_heads, config.attention_probs_dropout_prob)
+            self.label_to_text_attn = CrossAttention(config.hidden_size, config.num_attention_heads, config.attention_probs_dropout_prob)
+            self.ln_text = nn.LayerNorm(config.hidden_size)
+            self.ln_label = nn.LayerNorm(config.hidden_size)
+
         self.init_weights()
 
     def get_output_embeddings(self):
@@ -91,7 +97,6 @@ class Prompt(BertPreTrainedModel):
 
     def init_embedding(self):
         depth = len(self.depth2label)
-        # 加入 weights_only=False 适配更新版本 pytorch 的安全机制
         label_dict = torch.load(os.path.join(self.data_path, 'value_dict.pt'), weights_only=False)
         tokenizer = AutoTokenizer.from_pretrained(self.name_or_path)
         label_dict = {i: tokenizer.encode(v) for i, v in label_dict.items()}
@@ -102,28 +107,20 @@ class Prompt(BertPreTrainedModel):
                 input_embeds.weight.index_select(0, torch.tensor(label_dict[i], device=self.device)).mean(dim=0))
         prefix = input_embeds(torch.tensor([tokenizer.mask_token_id],
                                            device=self.device, dtype=torch.long))
-        # prompt
-        prompt_embedding = nn.Embedding(depth + 1,
-                                        input_embeds.weight.size(1), 0)
+        prompt_embedding = nn.Embedding(depth + 1, input_embeds.weight.size(1), 0)
 
         self._init_weights(prompt_embedding)
-        # label prompt mask
         label_emb = torch.cat(
             [torch.stack(label_emb), prompt_embedding.weight[1:, :], prefix], dim=0)
         embedding = GraphEmbedding(self.config, input_embeds, label_emb, self.graph_type,
                                    path_list=self.path_list, layer=self.layer, data_path=self.data_path)
         self.set_input_embeddings(embedding)
 
-        # 移除原有的 OutputEmbedding 自定义类包装机制
-        # 直接使用系统原生的 decoder 处理 bias 的 padding，避免 DataParallel 函数指针分配在单卡上的问题
         decoder = self.get_output_embeddings()
         self.vocab_size = decoder.bias.size(0)
         decoder.bias = nn.Parameter(nn.functional.pad(
             decoder.bias.data,
-            (
-                0,
-                embedding.size - decoder.bias.shape[0],
-            ),
+            (0, embedding.size - decoder.bias.shape[0]),
             "constant",
             0,
         ))
@@ -179,26 +176,52 @@ class Prompt(BertPreTrainedModel):
 
         sequence_output = outputs[0]
 
-        # 核心修改：拦截原本的 self.cls(sequence_output)
-        # 动态获取当前 GPU Replica 上的 GraphEmbedding 并产生最新的张量权重参与 Linear 计算
         hidden_states = self.cls.predictions.transform(sequence_output)
         weight = self.get_input_embeddings().raw_weight()
         bias = self.get_output_embeddings().bias
-        prediction_scores = F.linear(hidden_states, weight, bias)
+
+        # === 双向交叉注意力 ===
+        if self.use_cross_attn:
+            label_weight = weight[self.vocab_size : self.vocab_size + self.num_labels]
+            label_weight = label_weight.unsqueeze(0).expand(hidden_states.size(0), -1, -1)
+
+            text_attn_out, _, _ = self.text_to_label_attn(hidden_states, key_value_states=label_weight)
+            hidden_states = self.ln_text(hidden_states + text_attn_out)
+
+            label_attn_out, _, _ = self.label_to_text_attn(label_weight, key_value_states=hidden_states)
+            label_weight = self.ln_label(label_weight + label_attn_out)
+
+            base_weight = weight.unsqueeze(0).expand(hidden_states.size(0), -1, -1)
+            combined_weight = torch.cat([
+                base_weight[:, :self.vocab_size, :], 
+                label_weight, 
+                base_weight[:, self.vocab_size + self.num_labels:, :]
+            ], dim=1)
+            
+            prediction_scores = torch.bmm(hidden_states, combined_weight.transpose(1, 2)) + bias
+        else:
+            prediction_scores = F.linear(hidden_states, weight, bias)
 
         masked_lm_loss = None
 
         if labels is not None:
-            loss_fct = CrossEntropyLoss()  # -100 index = padding token
+            loss_fct = CrossEntropyLoss()
             masked_lm_loss = loss_fct(prediction_scores.view(-1, prediction_scores.size(-1)),
                                       single_labels.view(-1))
             multiclass_logits = prediction_scores.masked_select(
-                multiclass_pos.unsqueeze(-1).expand(-1, -1, prediction_scores.size(-1))).view(-1,
-                                                                                              prediction_scores.size(
-                                                                                                  -1))
-            multiclass_logits = multiclass_logits[:,
-                                self.vocab_size:self.vocab_size + self.num_labels] + self.multiclass_bias
+                multiclass_pos.unsqueeze(-1).expand(-1, -1, prediction_scores.size(-1))).view(-1, prediction_scores.size(-1))
+            multiclass_logits = multiclass_logits[:, self.vocab_size:self.vocab_size + self.num_labels] + self.multiclass_bias
+            
             multiclass_loss = multilabel_categorical_crossentropy(labels.view(-1, self.num_labels), multiclass_logits)
+            
+            # === 计算高阶约束损失 ===
+            if self.use_const_loss and self.value2slot is not None and self.depth_dict is not None:
+                from .loss import advanced_hierarchical_constraint_loss
+                const_loss = advanced_hierarchical_constraint_loss(
+                    multiclass_logits, self.value2slot, self.depth_dict, multiclass_logits.device, margin=0.5
+                )
+                multiclass_loss += const_loss 
+
             masked_lm_loss += multiclass_loss
 
         if not return_dict:
@@ -216,7 +239,6 @@ class Prompt(BertPreTrainedModel):
         input_shape = input_ids.shape
         effective_batch_size = input_shape[0]
 
-        #  add a dummy token
         assert self.config.pad_token_id is not None, "The PAD token should be defined for generation"
         attention_mask = torch.cat([attention_mask, attention_mask.new_zeros((attention_mask.shape[0], 1))], dim=-1)
         dummy_token = torch.full(
