@@ -191,8 +191,16 @@ if __name__ == '__main__':
             json.dump(index, open(low_res_path, 'w', encoding='utf-8'))
         dataset['train'] = dataset['train'].select(index[len(index) // 5:len(index) // 10 * 3])
 
-    model = Prompt.from_pretrained(args.arch, num_labels=len(label_dict), path_list=path_list, layer=args.layer,
-                                   graph_type=args.graph, data_path=data_path, depth2label=depth2label, )
+    
+    model = Prompt.from_pretrained(
+        args.arch, num_labels=len(label_dict), path_list=path_list, layer=args.layer,
+        graph_type=args.graph, data_path=data_path, depth2label=depth2label,
+        use_cross_attn=args.use_cross_attn,    # 传入注意力开关
+        use_const_loss=args.use_const_loss,    # 传入损失开关
+        value2slot=value2slot,                 # 传入层级字典
+        depth_dict=depth_dict                  # 传入深度字典
+    )
+    
     model.init_embedding()
     model.to('cuda')
 
