@@ -36,6 +36,8 @@ def parse():
     parser.add_argument('--graph', type=str, default='GAT')
     parser.add_argument('--low-res', default=False, action='store_true')
     parser.add_argument('--seed', default=3, type=int)
+    parser.add_argument('--use_cross_attn', default=False, action='store_true')
+    parser.add_argument('--use_const_loss', default=False, action='store_true')
     return parser
 
 
