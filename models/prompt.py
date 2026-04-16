@@ -223,10 +223,16 @@ class Prompt(BertPreTrainedModel):
             masked_lm_loss += multiclass_loss
 
             # =====================================================================
-            # 改进一核心(Train)：注入三元组层次分离损失
+            # 改进一核心(Train)：注入三元组层次分离损失，并兼容多卡 DataParallel
             # =====================================================================
             if self.ablation_hierarchical_loss and self.value2slot is not None:
-                active_labels = (labels.view(-1, self.num_labels) == 1)
+                # 获取当前 GPU 上被 DataParallel 分配的实际 batch_size (如 8)
+                bsz = sequence_output.size(0)
+                
+                # 将展平的 labels 恢复为 [bsz, max_depth, num_labels]
+                # 然后在深度维度 (dim=1) 上用 .any() 压缩，得到当前样本真正激活的类 [bsz, num_labels]
+                active_labels = (labels.view(bsz, -1, self.num_labels) == 1).any(dim=1)
+                
                 label_weights = weight[self.vocab_size : self.vocab_size + self.num_labels]
                 sep_loss = hierarchical_separation_loss(
                     text_features=sequence_output, 
@@ -235,7 +241,7 @@ class Prompt(BertPreTrainedModel):
                     active_labels=active_labels,
                     margin=0.5
                 )
-                masked_lm_loss += 0.1 * sep_loss  # 平衡系数可以调参，推荐0.1
+                masked_lm_loss += 0.1 * sep_loss  # 平衡系数
 
         if not return_dict:
             output = (prediction_scores,) + outputs[2:]
