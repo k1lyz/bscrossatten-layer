@@ -15,39 +15,36 @@ def multilabel_categorical_crossentropy(y_true, y_pred):
     pos_loss = torch.logsumexp(y_pred_pos, dim=-1)
     return (neg_loss + pos_loss).mean()
 
-
-def advanced_hierarchical_constraint_loss(logits, value2slot, depth_dict, device, margin=0.5, base_weight=2.0):
+def hierarchical_separation_loss(text_features, label_embeddings, value2slot, active_labels, margin=0.5):
     """
-    高阶层次约束损失：支持动态安全间隔 (Margin) 与 深度自适应权重 (Depth-adaptive)
+    改进一：三元组层次分离损失 (Hierarchical Separation Loss)
+    确保子标签嵌入靠近支持它的文本特征，而与父标签保持距离，防止特征坍缩。
     """
-    child_idx = []
-    parent_idx = []
-    depth_weights = []
+    loss = 0.0
+    valid_triplets = 0
     
-    for child, parent in value2slot.items():
-        if parent != -1 and child < logits.size(1) and parent < logits.size(1):
-            child_idx.append(child)
-            parent_idx.append(parent)
-            
-            # 计算深度权重：层级越浅，权重越大
-            child_depth = depth_dict.get(child, 2) 
-            weight = base_weight ** (2 - child_depth) 
-            depth_weights.append(weight)
-            
-    if not child_idx:
-        return torch.tensor(0.0, device=device)
-
-    # GPU 张量化加速
-    child_idx = torch.tensor(child_idx, device=device)
-    parent_idx = torch.tensor(parent_idx, device=device)
-    depth_weights = torch.tensor(depth_weights, device=device, dtype=torch.float32)
-
-    child_logits = logits[:, child_idx]
-    parent_logits = logits[:, parent_idx]
-
-    # Margin 边界惩罚与平方平滑
-    violation = child_logits - parent_logits + margin
-    squared_penalty = violation.clamp(min=0) ** 2
-    weighted_penalty = squared_penalty * depth_weights.unsqueeze(0)
+    # 提取池化后的文本证据特征 (对序列长度求平均)
+    text_evidence = text_features.mean(dim=1) # [batch_size, hidden_size]
     
-    return weighted_penalty.mean()
+    for b in range(active_labels.size(0)):
+        labels = active_labels[b].nonzero(as_tuple=True)[0]
+        for child_idx in labels:
+            child_idx = child_idx.item()
+            parent_idx = value2slot.get(child_idx, -1)
+            
+            if parent_idx != -1:
+                v_c = label_embeddings[child_idx]
+                v_p = label_embeddings[parent_idx]
+                h_c = text_evidence[b]
+                
+                # 计算余弦距离: D(v_c, h_c) - D(v_c, v_p) + margin
+                dist_evidence = 1.0 - F.cosine_similarity(v_c.unsqueeze(0), h_c.unsqueeze(0))
+                dist_parent = 1.0 - F.cosine_similarity(v_c.unsqueeze(0), v_p.unsqueeze(0))
+                
+                triplet_loss = F.relu(dist_evidence - dist_parent + margin)
+                loss += triplet_loss
+                valid_triplets += 1
+                
+    if valid_triplets > 0:
+        return (loss / valid_triplets).squeeze()
+    return torch.tensor(0.0, device=text_features.device)
