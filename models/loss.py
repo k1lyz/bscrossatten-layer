@@ -83,7 +83,7 @@ def topology_aware_hierarchical_loss(text_features, label_embeddings, value2slot
                 # 合并违规程度 (只惩罚大于0的部分)
                 total_diff = F.relu(diff_parent)
                 if ablation_mode in ['B', 'C', 'D']:
-                    total_diff += 0.5 * F.relu(diff_sibling)
+                    total_diff = total_diff + 0.5 * F.relu(diff_sibling)
                 
                 if total_diff > 0:
                     # ==== 实验 D (Ours)：Focal 困难样本加权 ====
@@ -94,7 +94,7 @@ def topology_aware_hierarchical_loss(text_features, label_embeddings, value2slot
                     else:
                         weight = 1.0 # 实验 A, B, C 不加权
                         
-                    loss += weight * total_diff
+                    loss = loss + weight * total_diff
                     valid_triplets += 1
                 
     if valid_triplets > 0:
