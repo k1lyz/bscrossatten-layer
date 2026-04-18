@@ -24,7 +24,7 @@ def parse():
     parser = argparse.ArgumentParser()
     parser.add_argument('--lr', type=float, default=3e-5)
     parser.add_argument('--data', type=str, default='WebOfScience')
-    parser.add_argument('--batch', type=int, default=2)
+    parser.add_argument('--batch', type=int, default=16)
     parser.add_argument('--early-stop', type=int, default=6)
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--name', type=str, required=True)
@@ -42,6 +42,9 @@ def parse():
     parser.add_argument('--ablation_hierarchical_loss', action='store_true', help='开启三元组层次分离损失 (标签一致性)')
     parser.add_argument('--ablation_cross_attn', action='store_true', help='开启文本-标签概念深度交叉注意力 (语义交互)')
     parser.add_argument('--ablation_deep_prefix', action='store_true', help='开启SPIRIT深度前缀融合 (结构融合)')
+    
+    parser.add_argument('--ablation_mode', type=str, default='D', choices=['A', 'B', 'C', 'D'], 
+                        help='A: 仅父节点排斥 | B: A+兄弟排斥 | C: B+密度自适应Margin | D: C+Focal加权(完全体)')
     
     return parser
 
@@ -192,7 +195,8 @@ if __name__ == '__main__':
                                    ablation_logits_mask=args.ablation_logits_mask,
                                    ablation_hierarchical_loss=args.ablation_hierarchical_loss,
                                    ablation_cross_attn=args.ablation_cross_attn,
-                                   ablation_deep_prefix=args.ablation_deep_prefix)
+                                   ablation_deep_prefix=args.ablation_deep_prefix,
+                                   ablation_mode=args.ablation_mode)
     model.init_embedding()
     model.to('cuda')
 
