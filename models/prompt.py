@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch
 from transformers import AutoTokenizer
 import os
-from .loss import multilabel_categorical_crossentropy, hierarchical_separation_loss
+from .loss import multilabel_categorical_crossentropy, topology_aware_hierarchical_loss
 from .graph import GraphEncoder
 from .attention import CrossAttention
 import math
@@ -85,6 +85,9 @@ class Prompt(BertPreTrainedModel):
         self.ablation_hierarchical_loss = kwargs.get('ablation_hierarchical_loss', False)
         self.ablation_cross_attn = kwargs.get('ablation_cross_attn', False)
         self.ablation_deep_prefix = kwargs.get('ablation_deep_prefix', False)
+        
+        # 接收消融实验模式参数 (A, B, C, D)
+        self.ablation_mode = kwargs.get('ablation_mode', 'D')
         
         # 改进三：文本-标签概念的深度交叉注意力融合模块
         if self.ablation_cross_attn:
@@ -226,22 +229,24 @@ class Prompt(BertPreTrainedModel):
             # 改进一核心(Train)：注入三元组层次分离损失，并兼容多卡 DataParallel
             # =====================================================================
             if self.ablation_hierarchical_loss and self.value2slot is not None:
-                # 获取当前 GPU 上被 DataParallel 分配的实际 batch_size (如 8)
                 bsz = sequence_output.size(0)
-                
-                # 将展平的 labels 恢复为 [bsz, max_depth, num_labels]
-                # 然后在深度维度 (dim=1) 上用 .any() 压缩，得到当前样本真正激活的类 [bsz, num_labels]
                 active_labels = (labels.view(bsz, -1, self.num_labels) == 1).any(dim=1)
                 
                 label_weights = weight[self.vocab_size : self.vocab_size + self.num_labels]
-                sep_loss = hierarchical_separation_loss(
+                
+                # 动态获取消融实验模式，默认为 'D' (完全体)
+                current_mode = getattr(self, 'ablation_mode', 'D')
+                
+                # 调用全新的拓扑与密度感知损失函数
+                sep_loss = topology_aware_hierarchical_loss(
                     text_features=sequence_output, 
                     label_embeddings=label_weights,
                     value2slot=self.value2slot,
                     active_labels=active_labels,
-                    margin=0.5
+                    base_margin=0.6,
+                    ablation_mode=current_mode # 传入实验模式
                 )
-                masked_lm_loss += 0.1 * sep_loss  # 平衡系数
+                masked_lm_loss += 0.1 * sep_loss
 
         if not return_dict:
             output = (prediction_scores,) + outputs[2:]
